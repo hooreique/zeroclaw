@@ -52,3 +52,6 @@ lcov.info
 
 # Wrangler cache
 .wrangler/
+
+/.zeroclaw
+/result*

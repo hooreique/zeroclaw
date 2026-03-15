@@ -1,0 +1,38 @@
+name: push-to-cachix
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Select environment
+        required: true
+        type: choice
+        options:
+          - hooreique
+
+jobs:
+  push-to-cachix:
+    runs-on: ubuntu-24.04-arm
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Check required vars
+        run: >
+          [ -n "${{ secrets.CACHIX_AUTH_TOKEN }}" ] &&
+          [ -n "${{ vars.CACHIX_CACHE }}" ] ||
+          { echo "Missing required vars"; exit 1; }
+
+      - uses: actions/checkout@v6.0.2
+
+      - uses: cachix/install-nix-action@v31.10.1
+
+      - uses: cachix/cachix-action@v17
+        with:
+          name: ${{ vars.CACHIX_CACHE }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build
+        run: nix build .#default
+
+      - name: Push
+        run: nix path-info -r "$(nix build .#default --print-out-paths --no-link)" | cachix push ${{ vars.CACHIX_CACHE }}

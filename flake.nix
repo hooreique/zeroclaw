@@ -1,61 +1,78 @@
 {
   inputs = {
-    flake-utils.url = "github:numtide/flake-utils";
-    fenix = {
-      url = "github:nix-community/fenix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     nixpkgs.url = "nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+    llm-agents.url = "github:numtide/llm-agents.nix/3a768998497f3cc4cc9ca20480b7f82a02222828";
   };
 
-  outputs = { flake-utils, fenix, nixpkgs, ... }:
-    let
-      nixosModule = { pkgs, ... }: {
-        nixpkgs.overlays = [ fenix.overlays.default ];
-        environment.systemPackages = [
-          (pkgs.fenix.stable.withComponents [
-            "cargo"
-            "clippy"
-            "rust-src"
-            "rustc"
-            "rustfmt"
-          ])
-          pkgs.rust-analyzer
-        ];
-      };
-    in
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      nixpkgs,
+      flake-utils,
+      llm-agents,
+      ...
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ fenix.overlays.default ];
-        };
-        rustToolchain = pkgs.fenix.stable.withComponents [
-          "cargo"
-          "clippy"
-          "rust-src"
-          "rustc"
-          "rustfmt"
-        ];
-      in {
-        packages.default = fenix.packages.${system}.stable.toolchain;
-        devShells.default = pkgs.mkShell {
-          packages = [
-            rustToolchain
-            pkgs.rust-analyzer
-          ];
-        };
-      }) // {
-      nixosConfigurations = {
-        nixos = nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
-          modules = [ nixosModule ];
+        pkgs = nixpkgs.legacyPackages.${system};
+
+        version = "0.6.5";
+        src = ./.;
+
+        zeroclaw-web = pkgs.buildNpmPackage {
+          pname = "zeroclaw-web";
+          version = version;
+          src = ./web;
+          npmDepsHash = "sha256-RMiFoPj4cbUYONURsCp4FrNuy9bR1eRWqgAnACrVXsI=";
+          installPhase = ''
+            runHook preInstall
+            cp -r dist $out
+            runHook postInstall
+          '';
         };
 
-        nixos-aarch64 = nixpkgs.lib.nixosSystem {
-          system = "aarch64-linux";
-          modules = [ nixosModule ];
+        zeroclaw = pkgs.rustPlatform.buildRustPackage {
+          pname = "zeroclaw";
+          inherit version src;
+
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+
+          cargoHash = "sha256-1/s2ijYqanhHIsYSw85c4H3T5phnAfvV7oQeAl/6lxQ=";
+
+          postPatch = ''
+            mkdir -p web
+            ln -s ${zeroclaw-web} web/dist
+          '';
+
+          doCheck = false;
+
+          postFixup = ''
+            wrapProgram $out/bin/zeroclaw \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.w3m-nographics ]}
+          '';
+
+          meta = {
+            description = "Fast, small, and fully autonomous AI assistant infrastructure - deploy anywhere, swap anything";
+            homepage = "https://github.com/zeroclaw-labs/zeroclaw";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "zeroclaw";
+          };
         };
-      };
-    };
+
+        codex = llm-agents.packages.${system}.codex;
+      in
+      {
+        packages = {
+          inherit zeroclaw zeroclaw-web;
+          default = zeroclaw;
+        };
+        devShells.default = pkgs.mkShell {
+          packages = [
+            pkgs.sqlite-interactive
+            codex
+          ];
+        };
+      }
+    );
 }

@@ -1,5 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use anyhow::Context;
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
@@ -7,7 +9,13 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_tungstenite::client_async_tls_with_config;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::Connector;
 use uuid::Uuid;
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
@@ -107,6 +115,32 @@ impl DiscordChannel {
         crate::config::build_channel_proxy_client("channel.discord", self.proxy_url.as_deref())
     }
 
+    async fn connect_gateway(
+        &self,
+        ws_url: &str,
+    ) -> anyhow::Result<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    > {
+        let request = ws_url.into_client_request()?;
+        let target_host = request
+            .uri()
+            .host()
+            .context("discord gateway URL is missing a host")?
+            .to_string();
+        let target_port = request.uri().port_u16().unwrap_or(443);
+
+        let tcp_stream = if let Some(proxy_url) = discord_gateway_proxy_url()? {
+            open_http_connect_tunnel(&proxy_url, &target_host, target_port).await?
+        } else {
+            TcpStream::connect((target_host.as_str(), target_port)).await?
+        };
+
+        let connector = Connector::Rustls(discord_gateway_tls_config());
+        let (ws_stream, _) =
+            client_async_tls_with_config(request, tcp_stream, None, Some(connector)).await?;
+        Ok(ws_stream)
+    }
+
     /// Check if a Discord user ID is in the allowlist.
     /// Empty list means deny everyone until explicitly configured.
     /// `"*"` means allow everyone.
@@ -119,6 +153,134 @@ impl DiscordChannel {
         let part = token.split('.').next()?;
         base64_decode(part)
     }
+}
+
+fn discord_gateway_proxy_url() -> anyhow::Result<Option<reqwest::Url>> {
+    let proxy = crate::config::runtime_proxy_config();
+    if !proxy.enabled {
+        return Ok(None);
+    }
+
+    let should_apply = proxy.should_apply_to_service("channel.discord")
+        || proxy.scope == crate::config::ProxyScope::Environment;
+    if !should_apply {
+        return Ok(None);
+    }
+
+    for candidate in [
+        proxy.https_proxy.as_deref(),
+        proxy.all_proxy.as_deref(),
+        proxy.http_proxy.as_deref(),
+    ] {
+        let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let parsed = reqwest::Url::parse(candidate)
+            .with_context(|| format!("invalid Discord proxy URL: {candidate}"))?;
+        return Ok(Some(parsed));
+    }
+
+    Ok(None)
+}
+
+fn discord_gateway_tls_config() -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    let rustls_native_certs::CertificateResult { certs, errors, .. } =
+        rustls_native_certs::load_native_certs();
+
+    if !errors.is_empty() {
+        tracing::warn!(?errors, "Discord gateway: native root CA loading reported errors");
+    }
+
+    let total_native = certs.len();
+    let (added_native, ignored_native) = roots.add_parsable_certificates(certs);
+    tracing::debug!(
+        total_native,
+        added_native,
+        ignored_native,
+        "Discord gateway: loaded native root certificates"
+    );
+
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+async fn open_http_connect_tunnel(
+    proxy_url: &reqwest::Url,
+    target_host: &str,
+    target_port: u16,
+) -> anyhow::Result<TcpStream> {
+    match proxy_url.scheme() {
+        "http" => {}
+        unsupported => {
+            anyhow::bail!(
+                "Discord gateway proxy scheme '{unsupported}' is not supported yet; use an http:// proxy URL"
+            );
+        }
+    }
+
+    let proxy_host = proxy_url
+        .host_str()
+        .context("proxy URL is missing a host")?;
+    let proxy_port = proxy_url
+        .port_or_known_default()
+        .context("proxy URL is missing a port")?;
+
+    let mut stream = TcpStream::connect((proxy_host, proxy_port)).await?;
+    let connect_target = format!("{target_host}:{target_port}");
+    let mut request = format!(
+        "CONNECT {connect_target} HTTP/1.1\r\nHost: {connect_target}\r\nProxy-Connection: Keep-Alive\r\n"
+    );
+
+    if !proxy_url.username().is_empty() || proxy_url.password().is_some() {
+        let credentials = format!(
+            "{}:{}",
+            proxy_url.username(),
+            proxy_url.password().unwrap_or_default()
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+        request.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
+    }
+
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await?;
+
+    let mut response = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            anyhow::bail!("proxy closed connection during CONNECT handshake");
+        }
+        response.extend_from_slice(&chunk[..read]);
+
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+
+        if response.len() > 16 * 1024 {
+            anyhow::bail!("proxy CONNECT response headers exceeded 16 KiB");
+        }
+    }
+
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|idx| idx + 4)
+        .context("proxy CONNECT response was missing header terminator")?;
+    let response_head = String::from_utf8_lossy(&response[..header_end]);
+    let status_line = response_head.lines().next().unwrap_or_default();
+
+    if !(status_line.starts_with("HTTP/1.1 200") || status_line.starts_with("HTTP/1.0 200")) {
+        anyhow::bail!("proxy CONNECT failed: {status_line}");
+    }
+
+    Ok(stream)
 }
 
 /// Process Discord message attachments and return a string to append to the
