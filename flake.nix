@@ -35,6 +35,7 @@
         zeroclaw = pkgs.rustPlatform.buildRustPackage {
           pname = "zeroclaw";
           inherit version src;
+          buildType = "ci";
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
