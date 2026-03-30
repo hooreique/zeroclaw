@@ -12389,6 +12389,7 @@ dependencies = [
  "rusqlite",
  "rust-embed",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "rustls-pki-types",
  "schemars 1.2.1",

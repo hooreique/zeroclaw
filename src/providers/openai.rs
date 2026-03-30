@@ -249,7 +249,8 @@ impl OpenAiProvider {
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
         messages
             .iter()
-            .map(|m| {
+            .enumerate()
+            .filter_map(|(idx, m)| {
                 if m.role == "assistant" {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
                         if let Some(tool_calls_value) = value.get("tool_calls") {
@@ -283,7 +284,8 @@ impl OpenAiProvider {
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
                                     reasoning_content,
-                                };
+                                }
+                                .into();
                             }
                         }
                     }
@@ -299,14 +301,27 @@ impl OpenAiProvider {
                             .get("content")
                             .and_then(serde_json::Value::as_str)
                             .map(ToString::to_string);
+                        if tool_call_id.is_none() {
+                            tracing::warn!(
+                                message_index = idx,
+                                "Skipping OpenAI tool history message without tool_call_id"
+                            );
+                            return None;
+                        }
                         return NativeMessage {
                             role: "tool".to_string(),
                             content,
                             tool_call_id,
                             tool_calls: None,
                             reasoning_content: None,
-                        };
+                        }
+                        .into();
                     }
+                    tracing::warn!(
+                        message_index = idx,
+                        "Skipping malformed OpenAI tool history message"
+                    );
+                    return None;
                 }
 
                 NativeMessage {
@@ -316,6 +331,7 @@ impl OpenAiProvider {
                     tool_calls: None,
                     reasoning_content: None,
                 }
+                .into()
             })
             .collect()
     }
@@ -865,6 +881,39 @@ mod tests {
         let native = OpenAiProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn convert_messages_skips_tool_message_without_tool_call_id() {
+        use crate::providers::ChatMessage;
+
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "content": "trimmed but missing id",
+            })
+            .to_string(),
+        )];
+        let native = OpenAiProvider::convert_messages(&messages);
+        assert!(native.is_empty());
+    }
+
+    #[test]
+    fn convert_messages_preserves_valid_tool_message() {
+        use crate::providers::ChatMessage;
+
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_123",
+                "content": "ok",
+            })
+            .to_string(),
+        )];
+        let native = OpenAiProvider::convert_messages(&messages);
+
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "tool");
+        assert_eq!(native[0].tool_call_id.as_deref(), Some("call_123"));
+        assert_eq!(native[0].content.as_deref(), Some("ok"));
     }
 
     #[test]

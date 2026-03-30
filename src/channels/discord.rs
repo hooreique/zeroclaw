@@ -189,7 +189,10 @@ fn discord_gateway_tls_config() -> Arc<rustls::ClientConfig> {
         rustls_native_certs::load_native_certs();
 
     if !errors.is_empty() {
-        tracing::warn!(?errors, "Discord gateway: native root CA loading reported errors");
+        tracing::warn!(
+            ?errors,
+            "Discord gateway: native root CA loading reported errors"
+        );
     }
 
     let total_native = certs.len();

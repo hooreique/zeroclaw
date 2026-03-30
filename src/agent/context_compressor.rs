@@ -272,8 +272,7 @@ impl ContextCompressor {
                 continue;
             }
             let original_len = msg.content.len();
-            msg.content =
-                crate::agent::loop_::truncate_tool_result(&msg.content, max);
+            msg.content = crate::agent::history::truncate_tool_message_payload(&msg.content, max);
             saved += original_len - msg.content.len();
         }
         saved
@@ -832,6 +831,30 @@ mod tests {
         let mut history = vec![msg("user", &big), msg("assistant", &big)];
         let saved = compressor.fast_trim_tool_results(&mut history);
         assert_eq!(saved, 0);
+    }
+
+    #[test]
+    fn test_fast_trim_preserves_tool_call_id_in_json_payload() {
+        let config = ContextCompressionConfig {
+            protect_first_n: 0,
+            protect_last_n: 0,
+            tool_result_retrim_chars: 100,
+            ..Default::default()
+        };
+        let compressor = ContextCompressor::new(config, 128_000);
+        let content = serde_json::json!({
+            "tool_call_id": "call_123",
+            "content": "x".repeat(5_000),
+        })
+        .to_string();
+        let mut history = vec![msg("tool", &content)];
+
+        let saved = compressor.fast_trim_tool_results(&mut history);
+
+        assert!(saved > 0);
+        let parsed: serde_json::Value = serde_json::from_str(&history[0].content).unwrap();
+        assert_eq!(parsed["tool_call_id"], "call_123");
+        assert!(parsed["content"].as_str().unwrap().contains("truncated"));
     }
 
     #[test]

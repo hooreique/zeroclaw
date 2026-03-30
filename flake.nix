@@ -39,7 +39,7 @@
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
-          cargoHash = "sha256-1/s2ijYqanhHIsYSw85c4H3T5phnAfvV7oQeAl/6lxQ=";
+          cargoHash = "sha256-KytT626gCfVpshEJPZdB4RV69wv0bKuaSF/jErQgi+k=";
 
           postPatch = ''
             mkdir -p web
@@ -70,6 +70,10 @@
         };
         devShells.default = pkgs.mkShell {
           packages = [
+            pkgs.cargo
+            pkgs.clippy
+            pkgs.rustc
+            pkgs.rustfmt
             pkgs.sqlite-interactive
             codex
           ];

@@ -55,6 +55,29 @@ pub(crate) fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     )
 }
 
+/// Preserve structured tool payloads when trimming tool history for native
+/// tool providers like OpenAI. If the message is not valid tool-result JSON,
+/// leave it unchanged so downstream code can decide how to handle it.
+pub(crate) fn truncate_tool_message_payload(content: &str, max_chars: usize) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return content.to_string();
+    };
+
+    let tool_call_id = value
+        .get("tool_call_id")
+        .and_then(serde_json::Value::as_str);
+    let tool_content = value.get("content").and_then(serde_json::Value::as_str);
+
+    match (tool_call_id, tool_content) {
+        (Some(tool_call_id), Some(tool_content)) => serde_json::json!({
+            "tool_call_id": tool_call_id,
+            "content": truncate_tool_result(tool_content, max_chars),
+        })
+        .to_string(),
+        _ => content.to_string(),
+    }
+}
+
 /// Aggressively trim old tool result messages in history to recover from
 /// context overflow. Keeps the last `protect_last_n` messages untouched.
 /// Returns total characters saved.
@@ -68,7 +91,7 @@ pub(crate) fn fast_trim_tool_results(
     for msg in &mut history[..cutoff] {
         if msg.role == "tool" && msg.content.len() > trim_to {
             let original_len = msg.content.len();
-            msg.content = truncate_tool_result(&msg.content, trim_to);
+            msg.content = truncate_tool_message_payload(&msg.content, trim_to);
             saved += original_len - msg.content.len();
         }
     }
@@ -142,7 +165,10 @@ impl InteractiveSessionState {
     }
 }
 
-pub(crate) fn load_interactive_session_history(path: &Path, system_prompt: &str) -> Result<Vec<ChatMessage>> {
+pub(crate) fn load_interactive_session_history(
+    path: &Path,
+    system_prompt: &str,
+) -> Result<Vec<ChatMessage>> {
     if !path.exists() {
         return Ok(vec![ChatMessage::system(system_prompt)]);
     }
@@ -166,4 +192,30 @@ pub(crate) fn save_interactive_session_history(path: &Path, history: &[ChatMessa
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
     std::fs::write(path, payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_tool_message_payload_preserves_tool_call_id() {
+        let content = serde_json::json!({
+            "tool_call_id": "call_123",
+            "content": "x".repeat(500),
+        })
+        .to_string();
+
+        let trimmed = truncate_tool_message_payload(&content, 100);
+        let parsed: serde_json::Value = serde_json::from_str(&trimmed).unwrap();
+
+        assert_eq!(parsed["tool_call_id"], "call_123");
+        assert!(parsed["content"].as_str().unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn truncate_tool_message_payload_leaves_non_json_unchanged() {
+        let content = "not json";
+        assert_eq!(truncate_tool_message_payload(content, 100), content);
+    }
 }
